@@ -30,8 +30,16 @@ class MultiHeadAttention(nn.Module):
         scores = F.softmax(scores, dim=-1)
         if dropout is not None:
             scores = dropout(scores)
+        # score 的第一行，逐个乘以 v 的列，形成新的第一行，共 d_k 个元素
+        # 因此可以认为 score 的每行代表一个头，output 矩阵每一行代表各个头的加权结果
         # (bs, h, T, T) @ (bs, h, T, dk) => (bs, h, T, dk)
         output = scores @ v 
+        # 这里是先计算分数，然后 mask，做softmax，dropout，可以换顺序吗？
+        # dropout 肯定在最终结果出来后，因此最后
+        # softmax 肯定是分数出来之后，mask 影响分数，因此必须在 mask 之后
+        # scores 我们可以理解为 T 长度的token互相之间的影响，即 (T, T) 矩阵
+        # scores 是通过隐藏的q_linear, k_linear 变换后的 q*k^T 算出来的，这个训练出来的变换的参数才是知识
+        # 这里的 q_linear， k_linear 是 (d_model, d_model) 维度的，包括了所有 vocab 之间关系的知识 <- 九阴真经
         return output
 
     def forward(self, q, k, v, mask=None):
