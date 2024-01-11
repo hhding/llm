@@ -20,6 +20,8 @@ class MultiHeadAttention(nn.Module):
         self.out = nn.Linear(d_model, d_model)
 
     def attention(self, q, k, v, mask=None, dropout=None):
+        # 这里 scale 还是必有，要不然 softmax 产生一些比较极端的输出结果，导致训练不稳定
+        # 可以注意一下 softmax 后的分数是不是过于集中或者过于散开，或者训练是否稳定
         # (bs, h, T, d_k) @ (bs, h, d_k, T) => (bs, h, T, T)
         scores = (q @ k.transpose(-1, -2)) / self.scale 
         if mask is not None:
@@ -38,7 +40,7 @@ class MultiHeadAttention(nn.Module):
         # dropout 肯定在最终结果出来后，因此最后
         # softmax 肯定是分数出来之后，mask 影响分数，因此必须在 mask 之后
         # scores 我们可以理解为 T 长度的token互相之间的影响，即 (T, T) 矩阵
-        # scores 是通过隐藏的q_linear, k_linear 变换后的 q*k^T 算出来的，这个训练出来的变换的参数才是知识
+        # scores 是通过隐藏的q_linear, k_linear 变换后的 q @ k.transpose 算出来的，这个训练出来的变换的参数才是知识
         # 这里的 q_linear， k_linear 是 (d_model, d_model) 维度的，包括了所有 vocab 之间关系的知识 <- 九阴真经
         return output
 
