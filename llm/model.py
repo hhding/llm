@@ -25,6 +25,8 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             scores.masked_fill(mask == 0, -1e9)
 
+        # A=(T, T) @ B=(T, d_k)
+        # 矩阵A乘以B：A行xB列，因此 softmax 应该操作 A 的行，即 dim=-1
         scores = F.softmax(scores, dim=-1)
         if dropout is not None:
             scores = dropout(scores)
@@ -34,9 +36,9 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, q, k, v, mask=None):
         bs = q.size(0) # q, k, v 的原始结构为 (bs, T, C); size(0)=>bs
-        # (bs, T, C) => (bs, T, h, d_k) => (bs, h, T, d_k)；这里的 -1 维度是 T。
         # 矩阵计算只涉及到最后两个维度，即 (T, dk)，效果上相当于变成了按 bs，h 分组了，也就是变成了多头了。
         # 可以看作是将 C 拆成了 h 个 d_k 维矩阵，然后对每个矩阵分别用不同的注意力头去处理。
+        # (bs, T, C) => (bs, T, h, d_k) => (bs, h, T, d_k)；这里的 -1 维度是 T。
         q = self.q_linear(q).view(bs, -1, self.h, self.d_k).transpose(1, 2)
         k = self.q_linear(k).view(bs, -1, self.h, self.d_k).transpose(1, 2)
         v = self.q_linear(v).view(bs, -1, self.h, self.d_k).transpose(1, 2)
