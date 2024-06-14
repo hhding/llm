@@ -299,12 +299,68 @@ typedef struct {
     unsigned long long rnd_state;
 } Sampler;
 
+int sample_argmax(float* probabilities, int n) {
+    int max_i = 0;
+    float max_p = probabilities[0];
+    for (int i = 1; i < n; i++) {
+        if (probabilities[i] > max_p) {
+            max_i = i;
+            max_p = probabilities[i];
+        }
+    }
+    return max_i;
+}
+
+int sample_multi(float* probabilities, int n, float coin) {
+    float cdf = 0.0f;
+    for (int i = 0; i < n; i++) {
+        cdf += probabilities[i];
+        if (cdf > coin) return i;
+    }
+    return n - 1;
+}
+
+int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
+}
+
 void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
     sampler->vocab_size = vocab_size;
     sampler->temperature = temperature;
     sampler->topp = topp;
     sampler->rnd_state = rng_seed;
     sampler->probindex = malloc(vocab_size * sizeof(ProbIndex));
+}
+
+void free_sampler(Sampler* sampler) {
+    free(sampler->probindex);
+}
+
+unsigned int random_u32(unsigned long long *state) {
+    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+}
+float random_f32(unsigned long long *state) { // random float32 in [0,1)
+    return (random_u32(state) >> 8) / 16777216.0f;
+}
+
+int sample(Sampler* sampler, float* logits) {
+    int next;
+    if (sampler->temperature == 0.0f) {
+        next = sample_argmax(logits, sampler->vocab_size);
+    } else {
+        for (int q = 0; q<sampler->vocab_size; q++) {logits[q] /= sampler->temperature;}
+        softmax(logits, sampler->vocab_size);
+        float coin = random_f32(&sampler->rnd_state);
+        if (sampler->topp <= 0 || sampler->topp >= 1) {
+            next = sample_multi(logits, sampler->vocab_size, coin);
+        } else {
+            next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+        }
+    }
+    return next;
 }
 
 typedef struct {
@@ -438,6 +494,35 @@ void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
     }
+    // start the main loop
+    long start = 0;
+    int next;
+    int token = prompt_tokens[0];
+    int pos = 0;
+    while (pos < steps) {
+        float* logits = forward(transformer, token, pos);
+        if (pos < num_prompt_tokens) {
+            next = prompt_tokens[pos + 1];
+        } else {
+            next = sample(sampler, logits);
+        }
+        pos++;
+        if (next ==1) break;
+
+        char* piece = decode(tokenizer, token, next);
+        safe_printf(piece);
+        fflush(stdout);
+        token = next;
+
+        if (start == 0) start = time_in_ms();
+    }
+    printf("\n");
+
+    if (pos > 1) {
+        long end = time_in_ms();
+        fprintf(stderr, "achieved tok/s: %f\n", (pos-1)/(double)(end - start)*1000);
+    }
+    free(prompt_tokens);
 }
 
 void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
