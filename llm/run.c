@@ -185,6 +185,105 @@ float* forward(Transformer* transformer, int token, int pos) {
     RunState *s = &transformer->state;
     float *x = s->x;
     int dim = p->dim;
+    int kv_dim = (p->n_kv_heads * p->dim) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;    // integer multiplier of the kv sharing in multiquery
+    int hidden_dim = p->hidden_dim;
+    int head_size = p->dim / p->n_heads;
+
+    // 将 token 对应的 embedding 向量拷贝到 x
+    float* content_row = w->token_embedding_table + token * dim;
+    memcpy(x, content_row, dim*sizeof(*x));
+
+    // 开始对所有层进行 forward 计算
+    for (unsigned long long l = 0; l < p->n_layers; l++) {
+        // attention rmsnorm; save to: s->xb as input of q, k, v
+        rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
+
+        int loff = l * p->seq_len * kv_dim; // 当前层的偏移
+        s->k = s->key_cache + loff + pos * kv_dim;      // 再加上当前 pos 的偏移
+        s->v = s->value_cache + loff + pos * kv_dim;    // 会存当前 token 产生的 k，v
+
+        // qkv matmuls for this position
+        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+
+        // RoPE; 加上位置信息
+        for (int i = 0; i < dim; i++) {
+            int head_dim = i % head_size;
+            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float val = pos * freq;
+            float fcr = cosf(val);
+            float fci = sinf(val);
+            int rotn = i < kv_dim ? 2 : 1;
+            for (int v = 0; v < rotn; v++) {
+                float *vec = v == 0 ? s->q : s->k; // 超过 kvm_dim 后，只对 q 加位置信息
+                float v0 = vec[i];
+                float v1 = vec[i+1];
+                vec[i] = v0 * fcr - v1 * fci;
+                vec[i+1] = v0 * fci + v1 * fcr;
+            }
+        }
+
+        // multihead attention
+        int h;
+        #pragma omp parallel for private(h)
+        for (h = 0; h < p->n_heads; h++) {
+            // score = q @ k
+            float* q = s->q + h * head_size;
+            float* att = s->att + h * p->seq_len;
+            for (int t = 0; t < pos; t++) {
+                float * k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                float score = 0.0f;
+                for (int i = 0; i < head_size; i++) {
+                    score += q[i] * k[i];
+                }
+                score /= sqrtf(head_size);
+                att[t] = score;
+            }
+            softmax(att, pos+1);
+            // score @ v
+            float* xb = s->xb + h * head_size;  // 结果存这里
+            memset(xb, 0, head_size * sizeof(float));
+            for (int t = 0; t < pos; t++) {
+                float* v = s->value_cache + loff + t * kv_dim + (h/kv_dim) * head_size;
+                float a = att[t];
+                for (int i = 0; i < head_size; i++) {
+                    xb[i] += a * v[i];
+                }
+            }
+        }
+        // s->xb2: output = self.wo(output)
+        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        // s->xb2 = self.attention.forward(self.attention_norm(x))
+        // x = x + s->xb2
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb2[i];
+        }
+        // h = self.ffn_norm(h)
+        // h = self.w2( F.silu(self.w1(h)) * self.w3(h) )
+        // x = x + h
+        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        // SwiGLU non-linearity
+        for (int i = 0; i < hidden_dim; i++) {
+            float val = s->hb[i];
+            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+            val *= (1.0f / (1.0f + expf(-val)));
+            // elementwise multiply with w3(x)
+            val *= s->hb2[i];
+            s->hb[i] = val;
+        }
+        // self.w2(h)
+        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb[i];
+        }
+    }
+    rmsnorm(x, x, w->rms_final_weight, dim);
+    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    return s->logits;
 }
 
 typedef struct {
@@ -283,7 +382,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         str_buffer[str_len++] = *c;
         str_buffer[str_len] = '\0';
         // max length of utf-8 is 4
-        if((*(c+1)) & 0xC0 == 0x80 & str_len < 4) continue;
+        if((*(c+1) & 0xC0) == 0x80 & str_len < 4) continue;
         // got one charactor or one utf-8
         int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
         if (id != -1) {
@@ -306,7 +405,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         // 如果发现有多个匹配的，那么仅合并分数最高的那个
         // 如果发现合并后都不匹配，那么就说明全部到达最大长度了，结束这个流程
         for (int i = 0; i < *n_tokens; i++) {
-            sprintf(str_buffer, "%s%s", tokens[i], tokens[i+1]);
+            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
             int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
             if (id != -1 ) continue;
             if (t->vocab_scores[id] > best_score) {
@@ -334,7 +433,7 @@ void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
     if (prompt == NULL) {prompt = empty_prompt;}
     int num_prompt_tokens = 0;
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3)*sizeof(int));  // +3 for '\0', BOS, EOS
-    encode(tokenizer, prompt, 1, 0, prompt_tokens, num_prompt_tokens);
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);

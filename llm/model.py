@@ -69,7 +69,7 @@ class FeedForward(nn.Module):
         self.ln_2 = nn.Linear(d_ff, d_model)
 
     def forward(self, x):
-        x = self.dropout(F.relu(xself.ln_1(x)))
+        x = self.dropout(F.relu(self.ln_1(x)))
         x = self.ln_2(x)
         return x
 
