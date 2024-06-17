@@ -117,13 +117,15 @@ void read_checkpoints(char * checkpoint, Config* config, TransformerWeights* w,
                         int* fd, float** data, ssize_t* file_size) {
     FILE* fp = fopen(checkpoint, "rb");
     if (fread(config, sizeof(Config), 1, fp) != 1) {perror("error read checkpoint"); exit(EXIT_FAILURE);}
-    if (fseek(fp, 0, SEEK_END) == -1) {perror("error fseek checkpoint"), exit(EXIT_FAILURE);}
+    if (fseek(fp, 0, SEEK_END) == -1) {perror("error fseek checkpoint"); exit(EXIT_FAILURE);}
     *file_size = ftell(fp);
-    *fd = fileno(fp);
-    data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-    if(*data == MAP_FAILED) {perror("mmap failed!\n"), exit(EXIT_FAILURE);}
+    fclose(fp);
+    *fd = open(checkpoint, O_RDONLY);
+    if (*fd == -1) {perror("open checkpoint"); exit(EXIT_FAILURE);}
+    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+    if(*data == MAP_FAILED) {perror("mmap failed!\n"); exit(EXIT_FAILURE);}
     float* weight_ptr = *data + sizeof(Config)/sizeof(float);
-    memory_map_weight(w, config, weight_ptr, config->vocab_size >0? 1:0);
+    memory_map_weight(w, config, weight_ptr, config->vocab_size > 0? 1:0);
 }
 
 void build_tranformer(Transformer *t, char* checkpoint_path) {
@@ -173,10 +175,17 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     for (i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * w[j];
+            val += w[i * n + j] * x[j];
         }
         xout[i] = val;
     }
+}
+
+void show_value(float* v, int done_exit, char* note) {
+    printf("=========== start of %s \n", note);
+    for (int i = 0; i < 200; i+=10) printf("%.5f ", v[i]);
+    printf("\n");
+    if (done_exit > 0) exit(EXIT_FAILURE);
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
@@ -207,9 +216,8 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
-
         // RoPE; 加上位置信息
-        for (int i = 0; i < dim; i++) {
+        for (int i = 0; i < dim; i+=2) {
             int head_dim = i % head_size;
             float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
             float val = pos * freq;
@@ -232,7 +240,7 @@ float* forward(Transformer* transformer, int token, int pos) {
             // score = q @ k
             float* q = s->q + h * head_size;
             float* att = s->att + h * p->seq_len;
-            for (int t = 0; t < pos; t++) {
+            for (int t = 0; t <= pos; t++) {
                 float * k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
                 float score = 0.0f;
                 for (int i = 0; i < head_size; i++) {
@@ -241,12 +249,13 @@ float* forward(Transformer* transformer, int token, int pos) {
                 score /= sqrtf(head_size);
                 att[t] = score;
             }
+
             softmax(att, pos+1);
             // score @ v
             float* xb = s->xb + h * head_size;  // 结果存这里
             memset(xb, 0, head_size * sizeof(float));
-            for (int t = 0; t < pos; t++) {
-                float* v = s->value_cache + loff + t * kv_dim + (h/kv_dim) * head_size;
+            for (int t = 0; t <= pos; t++) {
+                float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
                 float a = att[t];
                 for (int i = 0; i < head_size; i++) {
                     xb[i] += a * v[i];
@@ -281,6 +290,7 @@ float* forward(Transformer* transformer, int token, int pos) {
             x[i] += s->xb[i];
         }
     }
+
     rmsnorm(x, x, w->rms_final_weight, dim);
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
     return s->logits;
@@ -315,12 +325,55 @@ int sample_multi(float* probabilities, int n, float coin) {
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += probabilities[i];
-        if (cdf > coin) return i;
+        if (coin < cdf) return i;
     }
     return n - 1;
 }
 
+int compare(const void* a, const void* b) {
+    ProbIndex* a_ = (ProbIndex*)a;
+    ProbIndex* b_ = (ProbIndex*)b;
+    if (a_->prob > b_->prob) return -1;
+    if (a_->prob < b_->prob) return 1;
+    return 0;
+}
+
 int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
+    // 假设 topp = 0.2，那么先滤出排名前 20% 的
+    float cutoff = (1.0f - topp) / (n - 1);
+    int n0 = 0;
+    for (int i = 0; i < n; i++) {
+        if (probabilities[i] > cutoff) {
+            probindex[n0].index = i;
+            probindex[n0].prob = probabilities[i];
+            n0++;
+        }
+    }
+    // 从大到小排序
+    qsort(probindex, n0, sizeof(ProbIndex), compare);
+    // 排名靠前的累加起来到 20% 就截止，
+    // 如果排名靠前的比较大，那么会提前截止
+    // 如果分数比较均匀，那么几乎没变
+    // 作用是过滤掉尾部概率比较小的候选对象
+    float cumulative_prob = 0.0f;
+    int last_idx = n0 - 1;
+    for (int i = 0; i < n0; i++) {
+        cumulative_prob += probindex[i].prob;
+        if (cumulative_prob > topp) {
+            last_idx = i;
+            break;
+        }
+    }
+    // 在这里再选取前 coin 概率的对象；
+    // 注意，原先是在累计概率为 1，现在是在概率为 cumulative_prob 的对象清单里面选取，这是这里的 float r 的作用
+    float r = coin * cumulative_prob;
+    float cdf = 0.0f;
+    for (int i = 0; i < last_idx; i++) {
+        cdf += probindex[i].prob;
+        if (r < cdf) return probindex[i].index;
+    }
+
+    return probindex[last_idx].index;
 }
 
 void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
@@ -351,6 +404,9 @@ int sample(Sampler* sampler, float* logits) {
     if (sampler->temperature == 0.0f) {
         next = sample_argmax(logits, sampler->vocab_size);
     } else {
+        // temperature 实际上最后是通过 softmax 来起到作用的
+        // 观察 softmax 的曲线，当参数略微变高的时候，其数值很快上升
+        // 因此提高 temperature 能够各个数值
         for (int q = 0; q<sampler->vocab_size; q++) {logits[q] /= sampler->temperature;}
         softmax(logits, sampler->vocab_size);
         float coin = random_f32(&sampler->rnd_state);
@@ -427,7 +483,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     if (text[0] != '\0') {
         tokens[(*n_tokens)++] = str_lookup(" ", t->sorted_vocab, t->vocab_size);
     }
-    // merge tow tokens (*2), '\0'(+1), +2 for UTF-8??
+    // merge two tokens (*2), '\0'(+1), +2 for UTF-8??
     char* str_buffer = malloc(t->max_token_length * 2 + 1 + 2);
     // UTF-8
     for (char* c = text; *c != '\0'; c++) {
@@ -452,6 +508,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         }
         str_len = 0;
     }
+
     // merge token[i] and token[i+1]
     while(1) {
         float best_score = -1e10;
@@ -460,10 +517,10 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         // 在这个递归里面，相邻两个 token 两两进行合并后查询 id
         // 如果发现有多个匹配的，那么仅合并分数最高的那个
         // 如果发现合并后都不匹配，那么就说明全部到达最大长度了，结束这个流程
-        for (int i = 0; i < *n_tokens; i++) {
+        for (int i = 0; i < (*n_tokens - 1); i++) {
             sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
             int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-            if (id != -1 ) continue;
+            if (id == -1 ) continue;
             if (t->vocab_scores[id] > best_score) {
                 best_score = t->vocab_scores[id];
                 best_id = id;   // 合并成哪个 ID
@@ -484,6 +541,37 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     free(str_buffer);
 }
 
+char *decode(Tokenizer* t, int prev_token, int token) {
+    char* piece = t->vocab[token];
+    // BOS
+    if (prev_token == 1) if (piece[0] == ' ') piece++;
+    unsigned char byte_val;
+    if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
+        return (char*)t->byte_pieces + byte_val * 2;
+    }
+    return piece;
+}
+
+void safe_printf(char* piece) {
+    if (piece == NULL) return;
+    if (piece[0] == '\0') return;
+    if (piece[1] == '\0') {
+        unsigned char byte_val = piece[0];
+        if(!(isprint(byte_val) || isspace(byte_val))) return;
+    }
+    printf("%s", piece);
+}
+
+// ----------------------------------------------------------------------------
+// utilities: time
+
+long time_in_ms() {
+    // return time in milliseconds, for benchmarking the model speed
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
+
 void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* prompt, int steps) {
     char* empty_prompt = "";
     if (prompt == NULL) {prompt = empty_prompt;}
@@ -501,7 +589,7 @@ void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
     int pos = 0;
     while (pos < steps) {
         float* logits = forward(transformer, token, pos);
-        if (pos < num_prompt_tokens) {
+        if (pos < num_prompt_tokens - 1) {
             next = prompt_tokens[pos + 1];
         } else {
             next = sample(sampler, logits);
@@ -590,7 +678,6 @@ int main(int argc, char** argv) {
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
-    fprintf(stderr, "run!\n");
     // run!
     if (strcmp(mode, "generate") == 0) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
